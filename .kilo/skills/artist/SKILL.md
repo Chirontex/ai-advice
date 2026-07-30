@@ -24,27 +24,42 @@ description: Художественная экспертиза — анализ 
 
 ---
 
-### Шаг 0: Обнаружение доступных инструментов
+### ⚠️ Шаг 0: Обнаружение доступных инструментов — ОБЯЗАТЕЛЬНО
 
-**Перед любым вызовом API** выясни, что доступно в текущем окружении:
+**Этот шаг НЕЛЬЗЯ пропускать.** Пропуск Шага 0 — причина №1 всех ошибок
+при API-вызовах (не та команда python, PowerShell-искажение base64,
+неправильный парсинг ответа). Всегда начинай работу с изображениями
+с детекции окружения.
+
+Выполни последовательно через `bash`:
 
 ```bash
-python3 --version 2>&1; echo "EXIT:$?"
-python --version 2>&1; echo "EXIT:$?"
+python --version 2>&1; "EXIT_PYTHON:$LASTEXITCODE"
 ```
 
-Логика выбора (по убыванию приоритета):
+```bash
+python3 --version 2>&1; "EXIT_PYTHON3:$LASTEXITCODE"
+```
+
+Логика выбора (по убыванию приоритета — на Windows `python` основной):
 
 | Результат | Переменная `$PYTHON` | Действие |
 |---|---|---|
-| `python3` есть (exit 0) | `$PYTHON = "python3"` | Используй Python-метод |
-| `python3` нет, `python` есть | `$PYTHON = "python"` | Используй Python-метод |
+| `python` есть (EXIT_PYTHON:0) | `$PYTHON = "python"` | Используй Python-метод |
+| `python` нет, `python3` есть | `$PYTHON = "python3"` | Используй Python-метод |
 | Ни одного нет | — | Переходи на **curl-метод** (fallback) |
+
+После определения `$PYTHON` используй его во всех последующих командах:
+`$PYTHON -c "..."`, `$PYTHON script.py`, `$PYTHON -m pip install ...` |
 
 **Python-метод — предпочтительный.** `json.dumps()` + `base64.b64encode()`
 работают идентично на Linux и Windows, не искажают base64 в отличие от
 PowerShell (`ConvertTo-Json`, `Invoke-WebRequest`). Python есть в stdlib
 (`json`, `base64`, `urllib.request`) — не требует установки пакетов.
+
+Если всё же нужен пакет (Pillow, Playwright и т.п.) — используй
+`$PYTHON -m pip install <пакет>`, а не голый `pip` (на Windows `pip`
+часто отсутствует в PATH или ведёт не на тот Python).
 
 **Curl-метод — fallback.** Если Python недоступен, используй `curl`
 (на Linux: `curl`, на Windows: `curl.exe`) + OS-специфичный base64-кодировщик.
