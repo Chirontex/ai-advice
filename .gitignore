@@ -4,3 +4,4 @@ user_context.md
 # Модели для скиллов (не коммитить)
 .kilo/artist-model.json
 .kilo/ocr-model.json
+.kilo/dev-model.json
