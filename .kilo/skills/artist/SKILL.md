@@ -10,11 +10,26 @@ description: Художественная экспертиза — анализ 
 
 ## Окружение
 
-Модель, URL провайдера и API-ключ читаются из gitignored-файла
+Модель, URL провайдера, API-ключ и стиль API читаются из gitignored-файла
 `.kilo/artist-model.json`. **Перед любой работой с изображениями:**
 1. Прочитай `.kilo/artist-model.json` через `read`
 2. Извлеки оттуда все поля
 3. Используй их как переменные в вызовах API
+
+Поле `api_style` определяет контракт вызова генерации:
+
+| Значение | Контракт |
+|---|---|
+| `"media"` | Асинхронный Media API: `POST /v1/media` → опрос `GET /v1/media/{id}` → `data[0].url` (CDN-ссылка, ~7 дней хранения). chat/completions для генерации НЕ работает: изображение списывается, но не возвращается |
+| `"chat"` | OpenAI-совместимый chat completions: text→image через `modalities`, результат в `choices[].message.images[].url` |
+
+Если поле отсутствует — сначала считай стиль `chat`, но проверь первый же
+запрос: пустой `content`/`images` при списанной генерации — признак, что
+провайдеру нужен стиль `media`.
+
+Смена провайдера: поменяй в конфиге `image_model`, `provider_url`, `api_key`
+и `api_style` на подходящие для нового провайдера — шаблоны ниже выбираются
+по `api_style`.
 
 ## Архитектура
 
@@ -73,10 +88,22 @@ PowerShell (`ConvertTo-Json`, `Invoke-WebRequest`). Python есть в stdlib
    отвергнет image_url с ошибкой «Invalid image_url format». Поле `modalities`
    нужно **только** для text→image генерации без входного изображения.
 
-2. **Сгенерированное изображение приходит в `choices[0].message.images[0].url`,
-   а НЕ в `content`.** Поле `content` при генерации — пустая строка.
+2. **Где лежит результат генерации — зависит от `api_style`:**
+   - `chat`: `choices[0].message.images` — массив data URL. У части моделей
+     (Gemini-генераторы) там промежуточные кадры — финальный рендер берётся
+     из **последнего** элемента массива.
+   - `media`: ответ асинхронный; результат появляется в `data[0].url`
+     (CDN-ссылка, хранится ~7 дней) после опроса статуса `completed`.
+   В обоих стилях `content` при генерации пуст — не ищи изображение там.
 
-3. **Таймаут для генерации — 300 секунд (5 минут).**
+3. **Параметры результата (разрешение, пропорции) передаются по-разному:**
+   - `chat`: верхнеуровневый объект `image_config`
+     (например `{"aspect_ratio": "4:5", "image_size": "2K"}`); состав полей
+     зависит от модели.
+   - `media`: поля `input.aspect_ratio`, `input.image_resolution`, `input.n`.
+
+4. **Таймаут:** `chat` — 300 секунд; `media` — опрос до 360 секунд
+   (интервал 5 секунд).
 
 ---
 
@@ -126,7 +153,11 @@ print(data["choices"][0]["message"]["content"])
 
 ### Генерация изображения (text → image)
 
-**С modalities — обязательно для text→image.**
+Шаблон выбирается по полю `api_style` из конфига.
+
+#### Стиль `chat` (OpenAI-совместимые шлюзы)
+
+**С modalities — обязательно для text→image. Параметры результата — в `image_config`.**
 
 ```python
 import json, base64, urllib.request, sys, os, tempfile
@@ -138,7 +169,9 @@ API_KEY = "<api_key>"
 body = json.dumps({
     "model": MODEL,
     "messages": [{"role": "user", "content": "<промпт>"}],
-    "modalities": ["image", "text"]   # ← обязательно для text→image
+    "modalities": ["image", "text"],   # ← обязательно для text→image
+    # Параметры результата; состав зависит от модели (см. правила выше)
+    "image_config": {"aspect_ratio": "1:1", "image_size": "2K"}
 }).encode()
 
 req = urllib.request.Request(
@@ -154,8 +187,12 @@ if "error" in data:
     print(f"ERROR: {data['error']['message']}", file=sys.stderr)
     sys.exit(1)
 
-# Изображение в images[0].url, НЕ в content
-img_url = data["choices"][0]["message"]["images"][0]["url"]
+# Изображение в message.images (массив data URL), НЕ в content.
+# Финальный рендер — последний элемент: у части моделей спереди промежуточные кадры.
+images = data["choices"][0]["message"].get("images") or []
+if not images:
+    raise RuntimeError("Изображение не получено: пустой message.images")
+img_url = images[-1]["url"]
 if img_url.startswith("data:image"):
     img_b64 = img_url.split(",", 1)[1]
     img_bytes = base64.b64decode(img_b64)
@@ -166,10 +203,74 @@ if img_url.startswith("data:image"):
     print(out_path)   # stdout → путь к файлу для последующего read
 ```
 
+#### Стиль `media` (асинхронный Media API)
+
+**chat/completions с `modalities` в стиле `media` НЕ работает: изображение
+генерируется и списывается, но не возвращается в ответе. Только Media API:
+создание задачи + опрос статуса + скачивание CDN-ссылки.**
+
+```python
+import json, urllib.request, sys, os, tempfile, time
+
+MODEL = "<model>"
+PROVIDER_URL = "<provider_url>"
+API_KEY = "<api_key>"
+
+# 1. Создать задачу генерации (async: true)
+body = json.dumps({
+    "model": MODEL,
+    "input": {
+        "prompt": "<промпт>",
+        "aspect_ratio": "3:4",       # auto или "1:1", "16:9", ...
+        "image_resolution": "2K",    # 1K / 2K / 4K (по провайдеру)
+        "n": 1
+    },
+    "async": True
+}).encode()
+req = urllib.request.Request(
+    f"{PROVIDER_URL}/media",
+    data=body,
+    headers={"Authorization": f"Bearer {API_KEY}", "Content-Type": "application/json"},
+    method="POST"
+)
+with urllib.request.urlopen(req, timeout=60) as resp:
+    media_id = json.loads(resp.read().decode())["id"]
+
+# 2. Опрашивать статус, пока не completed (не более 360 c)
+elapsed = 0
+while elapsed < 360:
+    req = urllib.request.Request(
+        f"{PROVIDER_URL}/media/{media_id}",
+        headers={"Authorization": f"Bearer {API_KEY}"},
+        method="GET"
+    )
+    with urllib.request.urlopen(req, timeout=30) as resp:
+        status = json.loads(resp.read().decode())
+    if status["status"] == "completed":
+        break
+    if status["status"] == "failed":
+        raise RuntimeError(f"media failed: {status.get('error')}")
+    time.sleep(5)
+    elapsed += 5
+
+# 3. Скачать результат: data — список, первый элемент — url (CDN, ~7 дней)
+url = status["data"][0]["url"]
+with urllib.request.urlopen(url, timeout=120) as resp:
+    img_bytes = resp.read()
+out_path = os.path.join(tempfile.gettempdir(), "kilo", "generated.png")
+os.makedirs(os.path.dirname(out_path), exist_ok=True)
+with open(out_path, "wb") as f:
+    f.write(img_bytes)
+print(out_path)
+```
+
 ### Трансформация изображения (image → image)
 
 Исходное изображение + промпт → новое изображение.
 **БЕЗ modalities** — модель выводит изображение по контексту промпта.
+Шаблон — по полю `api_style`.
+
+#### Стиль `chat` (OpenAI-совместимые шлюзы)
 
 ```python
 import json, base64, urllib.request, sys, os, tempfile
@@ -182,7 +283,7 @@ source_path = "<абсолютный путь к исходному изобра
 with open(source_path, "rb") as f:
     src_b64 = base64.b64encode(f.read()).decode()
 
-# БЕЗ modalities
+# БЕЗ modalities; результат — как при генерации (images[-1], см. правила)
 body = json.dumps({
     "model": MODEL,
     "messages": [{
@@ -191,7 +292,8 @@ body = json.dumps({
             {"type": "text", "text": "<промпт трансформации>"},
             {"type": "image_url", "image_url": {"url": f"data:image/png;base64,{src_b64}"}}
         ]
-    }]
+    }],
+    "image_config": {"aspect_ratio": "1:1", "image_size": "2K"}
 }).encode()
 
 req = urllib.request.Request(
@@ -207,7 +309,10 @@ if "error" in data:
     print(f"ERROR: {data['error']['message']}", file=sys.stderr)
     sys.exit(1)
 
-img_url = data["choices"][0]["message"]["images"][0]["url"]
+images = data["choices"][0]["message"].get("images") or []
+if not images:
+    raise RuntimeError("Изображение не получено: пустой message.images")
+img_url = images[-1]["url"]
 if img_url.startswith("data:image"):
     img_b64 = img_url.split(",", 1)[1]
     img_bytes = base64.b64decode(img_b64)
@@ -218,12 +323,78 @@ if img_url.startswith("data:image"):
     print(out_path)
 ```
 
+#### Стиль `media` (асинхронный Media API)
+
+Исходник передаётся в `input.images` (base64 или URL), дальше — тот же
+цикл «задача → опрос → скачивание», что и при генерации.
+
+```python
+import json, base64, urllib.request, sys, os, tempfile, time
+
+MODEL = "<model>"
+PROVIDER_URL = "<provider_url>"
+API_KEY = "<api_key>"
+
+source_path = "<абсолютный путь к исходному изображению>"
+with open(source_path, "rb") as f:
+    src_b64 = base64.b64encode(f.read()).decode()
+
+body = json.dumps({
+    "model": MODEL,
+    "input": {
+        "prompt": "<промпт трансформации>",
+        "images": [{"type": "base64", "data": f"data:image/png;base64,{src_b64}"}],
+        "aspect_ratio": "1:1",
+        "image_resolution": "2K",
+        "n": 1
+    },
+    "async": True
+}).encode()
+req = urllib.request.Request(
+    f"{PROVIDER_URL}/media",
+    data=body,
+    headers={"Authorization": f"Bearer {API_KEY}", "Content-Type": "application/json"},
+    method="POST"
+)
+with urllib.request.urlopen(req, timeout=60) as resp:
+    media_id = json.loads(resp.read().decode())["id"]
+
+elapsed = 0
+while elapsed < 360:
+    req = urllib.request.Request(
+        f"{PROVIDER_URL}/media/{media_id}",
+        headers={"Authorization": f"Bearer {API_KEY}"},
+        method="GET"
+    )
+    with urllib.request.urlopen(req, timeout=30) as resp:
+        status = json.loads(resp.read().decode())
+    if status["status"] == "completed":
+        break
+    if status["status"] == "failed":
+        raise RuntimeError(f"media failed: {status.get('error')}")
+    time.sleep(5)
+    elapsed += 5
+
+url = status["data"][0]["url"]
+with urllib.request.urlopen(url, timeout=120) as resp:
+    img_bytes = resp.read()
+out_path = os.path.join(tempfile.gettempdir(), "kilo", "transformed.png")
+os.makedirs(os.path.dirname(out_path), exist_ok=True)
+with open(out_path, "wb") as f:
+    f.write(img_bytes)
+print(out_path)
+```
+
 ---
 
 ## Curl-метод (fallback — если Python недоступен)
 
 **Только если `python3` и `python` отсутствуют.** Используется `curl`
 (Linux: `curl`, Windows: `curl.exe`) + OS-специфичный base64.
+
+Покрывает стиль `chat` (chat completions). Для стиля `media` предпочтителен
+Python-метод — там нужны опрос статуса и скачивание; через curl это тоже
+возможно (POST `/media`, затем GET `/media/{id}` до `completed`), но громоздко.
 
 ### Linux
 
@@ -323,8 +494,10 @@ for ($i = 0; $i -lt $bytes.Length; $i++) {
 | «Invalid image_url format» | PowerShell / ConvertTo-Json исказил base64 | Используй Python-метод (`json.dumps`, `base64`) |
 | «Invalid image_url format» (Python или curl) | Присутствует `modalities` вместе с `image_url` | Убери `modalities` из запроса с `image_url` |
 | Пустой `content` при text→image | Отсутствует `modalities: ["image", "text"]` | Добавь `modalities` в text→image запрос |
-| Изображение не извлекается | Код ищет в `content`, а оно в `images[0].url` | Читай `data["choices"][0]["message"]["images"][0]["url"]` |
-| Таймаут при генерации | Мало времени | Python: `timeout=300`; curl: `--max-time 300` |
+| Генерация списалась, но `images`/`content` пустые | Провайдеру нужен Media API (стиль `media`) | Проверь `api_style` в конфиге; используй `POST /v1/media` + опрос статуса |
+| В `message.images` несколько изображений | У модели промежуточные кадры (Gemini-генераторы) | Бери последний элемент массива: `images[-1]` |
+| Изображение не извлекается | Код ищет в `content`, а оно в `images[].url` | Читай `data["choices"][0]["message"]["images"][-1]["url"]` |
+| Таймаут при генерации | Мало времени | Python: `timeout=300`; media: опрос до 360 c; curl: `--max-time 300` |
 | `curl` (Windows PowerShell) не работает | PowerShell алиас `curl` = `Invoke-WebRequest` | Используй `curl.exe` (с расширением) |
 | `base64` не найден (Linux) | Утилита не входит в минимальный образ | `openssl base64 -A -in <file>` |
 
