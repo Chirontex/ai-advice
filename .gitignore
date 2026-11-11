@@ -5,3 +5,7 @@ user_context.md
 .kilo/artist-model.json
 .kilo/ocr-model.json
 .kilo/dev-model.json
+
+# Артефакты Python (автогенерация, не коммитить)
+__pycache__/
+*.py[cod]
